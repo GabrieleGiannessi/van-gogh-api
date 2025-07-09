@@ -5,7 +5,15 @@ from uuid import uuid4
 from datetime import datetime, timezone
 from collections import defaultdict
 
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, UploadFile
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+    Form,
+)
 from fastapi.responses import StreamingResponse
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import bulk
@@ -19,13 +27,16 @@ logger = logging.getLogger(__name__)
 
 settings = Settings()
 
+
 def get_es_client():
     return Elasticsearch(settings.es_host)
+
 
 def get_mongo_client():
     client = MongoClient(settings.mongo_uri, serverSelectionTimeoutMS=5000)
     client.server_info()
     return client
+
 
 try:
     es = get_es_client()
@@ -78,8 +89,8 @@ def init_indices():
 @asynccontextmanager
 async def lifespan(router: APIRouter):
     init_indices()
-    yield  
-    
+    yield
+
 
 router = APIRouter(lifespan=lifespan)
 
@@ -130,12 +141,12 @@ def index_pdf_pages(doc_id, filename, sub, title, author, created_at):
             },
         )
 
+
 @router.post("/upload/")
 async def upload_pdf(
-    background_tasks: BackgroundTasks,
-    sub: str,
-    title: str,
-    author: str,
+    sub: str = Form(...),
+    title: str = Form(...),
+    author: str = Form(...),
     file: UploadFile = File(...),
 ):
     if not file.filename.lower().endswith(".pdf"):
@@ -158,11 +169,16 @@ async def upload_pdf(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"File creation error: {e}")
 
-    background_tasks.add_task(
-        index_pdf_pages, doc_id, file.filename, sub, title, author, created_at
-    )
+    try:
+        index_pdf_pages(doc_id, file.filename, sub, title, author, created_at)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Indexing error: {e}")
 
-    return {"doc_id": doc_id, "message": "File uploaded. Indexing in progress."}
+    return {
+        "doc_id": doc_id,
+        "message": "File uploaded and indexed.",
+        "download_link": f"/download/{doc_id}",
+    }
 
 
 @router.get("/documents/")
@@ -205,19 +221,19 @@ def get_docs_by_sub(sub: str):
 
 @router.get("/search")
 async def search_text(q: str = Query(..., description="Text to search")):
-    es_query = {
-        "query": {
-            "multi_match": {
-                "query": q,
-                "fields": ["text", "metadata.title"],
-                "fuzziness": "AUTO",
-            }
-        },
-        "highlight": {"fields": {"text": {}, "metadata.title": {}}},
-        "_source": ["doc_id", "page", "text", "metadata"],
-    }
+    
+    page_query = {"match": {"text": {"query": q, "fuzziness": "AUTO"}}}
 
-    res = es.search(index=PAGES_INDEX, body=es_query, size=100)
+    highlight = {"fields": {"text": {}, "title": {}}}
+    _source_pages = ["doc_id", "page", "text", "metadata"]
+
+    page_res = es.search(
+        index=PAGES_INDEX,
+        query=page_query,
+        highlight=highlight,
+        _source=_source_pages,
+        size=100,
+    )
 
     grouped = defaultdict(
         lambda: {
@@ -229,11 +245,13 @@ async def search_text(q: str = Query(..., description="Text to search")):
             "download_link": None,
             "metadata": {},
             "matching_pages": [],
+            "title_match": False,
         }
     )
 
     doc_ids = set()
-    for hit in res["hits"]["hits"]:
+
+    for hit in page_res["hits"]["hits"]:
         doc = hit["_source"]
         highlights = hit.get("highlight", {})
         doc_id = doc["doc_id"]
@@ -243,17 +261,42 @@ async def search_text(q: str = Query(..., description="Text to search")):
             {"page": doc["page"], "highlight": highlights, "text": doc["text"]}
         )
         doc_ids.add(doc_id)
-
+        
     if doc_ids:
-        docs_res = es.mget(index=DOCS_INDEX, body={"ids": list(doc_ids)})
-        for doc_hit in docs_res["docs"]:
-            if doc_hit.get("found"):
-                source = doc_hit["_source"]
-                doc_id = source["doc_id"]
-                if doc_id in grouped:
-                    grouped[doc_id]["title"] = source.get("title")
-                    grouped[doc_id]["download_link"] = source.get("download_link")
-                    grouped[doc_id]["metadata"] = source.get("metadata", {})
+        doc_query = {"terms": {"doc_id": list(doc_ids)}}
+
+        _source_docs = [
+            "doc_id",
+            "title",
+            "author",
+            "filename",
+            "download_link",
+            "metadata",
+            "sub",
+        ]
+
+        doc_res = es.search(
+            index=DOCS_INDEX,
+            query=doc_query,
+            highlight=highlight,
+            _source=_source_docs,
+            size=100,
+        )
+
+        for hit in doc_res["hits"]["hits"]:
+            source = hit["_source"]
+            doc_id = source["doc_id"]
+
+            grouped[doc_id]["doc_id"] = doc_id
+            grouped[doc_id]["title"] = source.get("title")
+            grouped[doc_id]["download_link"] = source.get("download_link")
+            grouped[doc_id]["metadata"] = source.get("metadata", {})
+            grouped[doc_id]["author"] = source.get("author")
+            grouped[doc_id]["filename"] = source.get("filename")
+            grouped[doc_id]["sub"] = source.get("sub")
+
+            if "highlight" in hit and "title" in hit["highlight"]:
+                grouped[doc_id]["title_match"] = True
 
     return list(grouped.values())
 
@@ -262,14 +305,17 @@ async def search_text(q: str = Query(..., description="Text to search")):
 def delete_document(doc_id: str):
     try:
         es.delete_by_query(
-            index=PAGES_INDEX, body={"query": {"match": {"doc_id": doc_id}}}
+            index=PAGES_INDEX,
+            body={"query": {"match": {"doc_id": doc_id}}},
+            refresh=True,
+            wait_for_completion=True,
         )
         try:
             res = es.get(index=DOCS_INDEX, id=doc_id)
             doc_data = res["_source"]
         except Exception:
             raise HTTPException(status_code=404, detail="Document not found")
-        es.delete(index=DOCS_INDEX, id=doc_id)
+        es.delete(index=DOCS_INDEX, id=doc_id, refresh=True)
         file = fs.find_one({"_id": doc_id})
         if file:
             fs.delete(file._id)

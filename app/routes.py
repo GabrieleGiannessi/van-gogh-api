@@ -23,7 +23,8 @@ from pymongo import AsyncMongoClient
 from gridfs.asynchronous import AsyncGridFSBucket
 import pdfplumber
 from pdf2image import convert_from_bytes
-from elasticSearch.models import Settings
+from app.models import Settings, DocumentCreate, DocumentRead
+from app.service import DocumentService
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,9 @@ def get_es_client():
 async def get_mongo_client():
     client = AsyncMongoClient(settings.mongo_uri, serverSelectionTimeoutMS=5000)
     return client
+
+def get_document_service(): 
+    return DocumentService()
 
 
 def init_indices():
@@ -161,28 +165,28 @@ async def upload_pdf(
     created_at = datetime.now(timezone.utc)
 
     try:
-        grid_in = await fs.open_upload_stream_with_id(
+        async with fs.open_upload_stream_with_id(
             doc_id,
             file.filename,
             chunk_size_bytes=4,
             metadata={"contentType": "application/pdf"},
-        )
-        try:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                await grid_in.write(chunk)
-        except Exception as e:
-            await fs.delete(grid_in._id)
-            raise HTTPException(status_code=500, detail=f"Save error: {e}")
-        finally:
-            await grid_in.close()
+        ) as grid_in: 
+            while True: 
+                try:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    await grid_in.write(chunk)
+                except Exception as e:
+                    await fs.delete(grid_in._id)
+                    raise HTTPException(status_code=500, detail=f"Save error: {e}")
+                finally:
+                    await grid_in.close()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"File creation error: {e}")
 
     try:
-        await index_pdf_pages(doc_id, file.filename, sub, title, author, created_at)
+         await index_pdf_pages(doc_id, file.filename, sub, title, author, created_at)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Indexing error: {e}")
 

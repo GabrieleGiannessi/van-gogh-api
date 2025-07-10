@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from elasticSearch.routes import router as elastic_router
+from app.routes import router as elastic_router
 
 app = FastAPI()
 

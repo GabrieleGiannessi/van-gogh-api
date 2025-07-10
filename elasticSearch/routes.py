@@ -4,6 +4,7 @@ import logging
 from uuid import uuid4
 from datetime import datetime, timezone
 from collections import defaultdict
+from io import BytesIO
 
 from fastapi import (
     APIRouter,
@@ -17,8 +18,9 @@ from fastapi import (
 from fastapi.responses import StreamingResponse
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import bulk
-from pymongo import MongoClient
-import gridfs
+from gridfs import NoFile
+from pymongo import AsyncMongoClient
+from gridfs.asynchronous import AsyncGridFSBucket
 import pdfplumber
 from pdf2image import convert_from_bytes
 from elasticSearch.models import Settings
@@ -27,28 +29,21 @@ logger = logging.getLogger(__name__)
 
 settings = Settings()
 
+fs = None
+documents_db = None
+es = None
+
+DOCS_INDEX = "docs"
+PAGES_INDEX = "pages"
+
 
 def get_es_client():
     return Elasticsearch(settings.es_host)
 
 
-def get_mongo_client():
-    client = MongoClient(settings.mongo_uri, serverSelectionTimeoutMS=5000)
-    client.server_info()
+async def get_mongo_client():
+    client = AsyncMongoClient(settings.mongo_uri, serverSelectionTimeoutMS=5000)
     return client
-
-
-try:
-    es = get_es_client()
-    mongo_client = get_mongo_client()
-    db = mongo_client["pdf_db"]
-    fs = gridfs.GridFS(db)
-except Exception as e:
-    logger.error(f"Database connection error: {e}")
-    raise
-
-DOCS_INDEX = "docs"
-PAGES_INDEX = "pages"
 
 
 def init_indices():
@@ -88,20 +83,30 @@ def init_indices():
 
 @asynccontextmanager
 async def lifespan(router: APIRouter):
+    global fs, documents_db, es
+    mongo_client = await get_mongo_client()
+    es = get_es_client()
+    documents_db = mongo_client.documents_db
+    fs = AsyncGridFSBucket(documents_db, "documents")
+
     init_indices()
+
     yield
 
 
 router = APIRouter(lifespan=lifespan)
 
 
-def index_pdf_pages(doc_id, filename, sub, title, author, created_at):
+async def index_pdf_pages(doc_id, filename, sub, title, author, created_at):
     try:
-        grid_out = fs.get(doc_id)
+        grid_out = await fs.open_download_stream(
+            doc_id
+        )  # Prendo i dati dal db riferiti dall' _id del documento
+        content = await grid_out.read()
     except Exception:
         return
 
-    with pdfplumber.open(grid_out) as pdf:
+    with pdfplumber.open(BytesIO(content)) as pdf:
         actions = []
         for i, page in enumerate(pdf.pages):
             try:
@@ -156,21 +161,28 @@ async def upload_pdf(
     created_at = datetime.now(timezone.utc)
 
     try:
-        grid_in = fs.new_file(_id=doc_id, filename=file.filename)
+        grid_in = await fs.open_upload_stream_with_id(
+            doc_id,
+            file.filename,
+            chunk_size_bytes=4,
+            metadata={"contentType": "application/pdf"},
+        )
         try:
-            while chunk := await file.read(1024 * 1024):
-                grid_in.write(chunk)
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                await grid_in.write(chunk)
         except Exception as e:
-            grid_in.close()
-            fs.delete(grid_in._id)
+            await fs.delete(grid_in._id)
             raise HTTPException(status_code=500, detail=f"Save error: {e}")
         finally:
-            grid_in.close()
+            await grid_in.close()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"File creation error: {e}")
 
     try:
-        index_pdf_pages(doc_id, file.filename, sub, title, author, created_at)
+        await index_pdf_pages(doc_id, file.filename, sub, title, author, created_at)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Indexing error: {e}")
 
@@ -221,7 +233,7 @@ def get_docs_by_sub(sub: str):
 
 @router.get("/search")
 async def search_text(q: str = Query(..., description="Text to search")):
-    
+
     page_query = {"match": {"text": {"query": q, "fuzziness": "AUTO"}}}
 
     highlight = {"fields": {"text": {}, "title": {}}}
@@ -261,7 +273,7 @@ async def search_text(q: str = Query(..., description="Text to search")):
             {"page": doc["page"], "highlight": highlights, "text": doc["text"]}
         )
         doc_ids.add(doc_id)
-        
+
     if doc_ids:
         doc_query = {"terms": {"doc_id": list(doc_ids)}}
 
@@ -302,7 +314,7 @@ async def search_text(q: str = Query(..., description="Text to search")):
 
 
 @router.delete("/documents/{doc_id}")
-def delete_document(doc_id: str):
+async def delete_document(doc_id: str):
     try:
         es.delete_by_query(
             index=PAGES_INDEX,
@@ -315,36 +327,55 @@ def delete_document(doc_id: str):
             doc_data = res["_source"]
         except Exception:
             raise HTTPException(status_code=404, detail="Document not found")
+
         es.delete(index=DOCS_INDEX, id=doc_id, refresh=True)
-        file = fs.find_one({"_id": doc_id})
-        if file:
-            fs.delete(file._id)
+        try:
+            file = await fs.open_download_stream(doc_id)
+        except NoFile:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        await fs.delete(file._id)
         return {"result": "deleted", "document": doc_data}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Delete error: {e}")
 
 
 @router.get("/download/{doc_id}")
-def download_document(doc_id: str, download: bool = True):
-    file = fs.find_one({"_id": doc_id})
-    if not file:
+async def download_document(doc_id: str, download: bool = True):
+    try:
+        file = await fs.open_download_stream(doc_id)
+        content = await file.read()
+    except NoFile:
         raise HTTPException(status_code=404, detail="File not found")
+
     disposition = "attachment" if download else "inline"
     headers = {"Content-Disposition": f'{disposition}; filename="{file.filename}"'}
     return StreamingResponse(
-        io.BytesIO(file.read()), media_type="application/pdf", headers=headers
+        io.BytesIO(content), media_type="application/pdf", headers=headers
     )
 
 
 @router.get("/preview/{file_id}")
-def preview_pdf(file_id: str):
-    file = fs.find_one({"_id": file_id})
-    if not file:
+async def preview_pdf(doc_id: str):
+    try:
+        grid_out = await fs.open_download_stream(doc_id)
+        content = await grid_out.read()  # ✅ Serve await per leggere i bytes!
+    except NoFile:
         raise HTTPException(status_code=404, detail="File not found")
-    images = convert_from_bytes(file.read(), first_page=1, last_page=1)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error accessing file: {e}")
+
+    try:
+        images = convert_from_bytes(content, first_page=1, last_page=1)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF conversion error: {e}")
+
     if not images:
         raise HTTPException(status_code=500, detail="Unable to create preview")
+
     img_bytes = io.BytesIO()
     images[0].save(img_bytes, format="PNG")
     img_bytes.seek(0)
+
     return StreamingResponse(img_bytes, media_type="image/png")

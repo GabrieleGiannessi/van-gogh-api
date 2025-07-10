@@ -1,16 +1,16 @@
 from datetime import datetime
 from typing import Optional
-from fastapi import Form, UploadFile
+from fastapi import Form, File
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 class Metadata (BaseModel):
     created_at: str
     
-class DocumentCreate(BaseModel):
+class DocumentCreateMetadata(BaseModel):
     sub: str 
     title: str 
     author: str 
-    file: UploadFile 
+    filename: str
     
 class DocumentRead(BaseModel):
     doc_id: str 
@@ -26,6 +26,7 @@ class DocumentPage (BaseModel):
     page: int
     text: str
     metadata: Metadata
+    highlight: Optional[dict[str, list[str]]] = None
     
 class IndexedDocument (BaseModel): 
     doc_id: str 
@@ -34,6 +35,17 @@ class IndexedDocument (BaseModel):
     author: str 
     filename: str
     created_at: datetime
+    
+class DocumentSearchResult(BaseModel):
+    doc_id: str
+    sub: Optional[str] = None
+    title: Optional[str] = None
+    author: Optional[str] = None
+    filename: Optional[str] = None
+    download_link: Optional[str] = None
+    metadata: Optional[Metadata] = None
+    title_match: bool = False
+    matching_pages: list[DocumentPage] = []
     
 class Settings(BaseSettings):
     mongo_uri: str = "mongodb://localhost:27017"

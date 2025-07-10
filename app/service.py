@@ -1,14 +1,29 @@
 # Service layer
+from collections import defaultdict
 from datetime import datetime, timezone
 from io import BytesIO
 from uuid import uuid4
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile
+from gridfs import NoFile
 import pdfplumber
-from app.models import DocumentCreate, DocumentRead, DocumentPage, IndexedDocument
+from app.models import (
+    DocumentCreateMetadata,
+    DocumentRead,
+    DocumentPage,
+    IndexedDocument,
+    DocumentSearchResult,
+)
 from elasticsearch import AsyncElasticsearch
 from gridfs.asynchronous import AsyncGridFSBucket
 from elasticsearch.helpers import async_bulk
-from app.exceptions import DocumentCreationError, DocumentIndexingError, PDFExtractionError, StreamError
+from app.exceptions import (
+    DocumentCreationError,
+    DocumentIndexingError,
+    DocumentDeleteError,
+    StreamError,
+)
+import pprint
+
 DOCS_INDEX = "docs"
 PAGES_INDEX = "pages"
 
@@ -25,48 +40,103 @@ class DocumentService:
     async def get_documents(self, es: AsyncElasticsearch) -> list[DocumentRead]:
         try:
             res = await es.search(index=DOCS_INDEX, query={"match_all": {}}, size=1000)
-            return [DocumentRead(hit["_source"]) for hit in res["hits"]["hits"]]
+            return [DocumentRead(**hit["_source"]) for hit in res["hits"]["hits"]]
         except Exception as e:
-            raise DocumentIndexingError(message=e)
+            raise DocumentIndexingError(e)
 
-    async def get_documents_by_sub(self, sub: str) -> DocumentRead | None:
-        pass
+    async def get_documents_by_sub(
+        self, es: AsyncElasticsearch, sub: str
+    ) -> list[DocumentRead]:
+        try:
+            res = await es.search(
+                index=DOCS_INDEX, query={"term": {"sub": sub}}, size=1000
+            )
+            return [DocumentRead(**hit["_source"]) for hit in res["hits"]["hits"]]
+        except Exception as e:
+            raise DocumentIndexingError(e)
 
-    async def get_documents_by_id(self, doc_id: str) -> DocumentRead | None:
-        pass
+    async def get_document_by_id(
+        self, es: AsyncElasticsearch, doc_id: str
+    ) -> DocumentRead | None:
+        try:
+            res = await es.search(
+                index=DOCS_INDEX,
+                query={"term": {"doc_id": doc_id}},
+                size=1,
+            )
+            hits = res["hits"]["hits"]
+            if not hits:
+                return None
+            return DocumentRead(**hits[0]["_source"])
+        except Exception as e:
+            raise DocumentIndexingError(e)
 
-    async def get_documents_pages_by_id(self, doc_id: str) -> list[DocumentPage]:
-        pass
+    async def get_documents_pages_by_id(
+        self, es: AsyncElasticsearch, doc_id: str
+    ) -> list[DocumentPage]:
+        try:
+            res = await es.search(
+                index=PAGES_INDEX,
+                body={"query": {"term": {"doc_id": doc_id}}, "size": 1000},
+            )
+            return [DocumentPage(**hit["_source"]) for hit in res["hits"]["hits"]]
+        except Exception as e:
+            raise DocumentIndexingError(e)
 
-    async def delete_document_by_id(self, doc_id: str) -> DocumentRead:
-        pass
+    async def delete_document_by_id(
+        self, fs: AsyncGridFSBucket, es: AsyncElasticsearch, doc_id: str
+    ) -> DocumentRead:
+        try:
+            await es.delete_by_query(
+                index=PAGES_INDEX,
+                body={"query": {"match": {"doc_id": doc_id}}},
+                refresh=True,
+                wait_for_completion=True,
+            )
+            try:
+                res = await es.get(index=DOCS_INDEX, id=doc_id)
+                doc_data = DocumentRead(**res["_source"])
+            except Exception as e:
+                raise DocumentIndexingError(e)
+
+            await es.delete(index=DOCS_INDEX, id=doc_id, refresh=True)
+            try:
+                file = await fs.open_download_stream(doc_id)
+            except NoFile as e:
+                raise StreamError(e)
+
+            await fs.delete(file._id)
+
+            return doc_data
+
+        except Exception as e:
+            raise DocumentDeleteError(e)
 
     async def create_document(
-        self, fs: AsyncGridFSBucket, es: AsyncElasticsearch, doc: DocumentCreate
-    ) -> None:
+        self,
+        fs: AsyncGridFSBucket,
+        es: AsyncElasticsearch,
+        metadata: DocumentCreateMetadata,
+        file: UploadFile,
+    ):
 
         doc_id = str(uuid4())
 
         try:
             async with fs.open_upload_stream_with_id(
                 doc_id,
-                doc.file.filename,
+                metadata.filename,
                 chunk_size_bytes=4,
                 metadata={"contentType": "application/pdf"},
             ) as grid_in:
                 while True:
-                    try:
-                        chunk = await doc.file.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        await grid_in.write(chunk)
-                    except Exception as e:
-                        await fs.delete(grid_in._id)
-                        raise DocumentCreationError(message=e)
-                    finally:
-                        await grid_in.close()
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    await grid_in.write(chunk) 
         except Exception as e:
-            raise Exception(message=e)
+            await fs.delete(grid_in._id)
+            raise DocumentCreationError(e)
 
         try:
             await self.index_document(
@@ -74,14 +144,15 @@ class DocumentService:
                 es,
                 IndexedDocument(
                     doc_id=doc_id,
-                    sub=doc.sub,
-                    title=doc.title,
-                    filename=doc.file.filename,
+                    sub=metadata.sub,
+                    title=metadata.title,
+                    author=metadata.author,
+                    filename=metadata.filename,
                     created_at=datetime.now(timezone.utc),
                 ),
             )
         except Exception as e:
-            raise DocumentIndexingError(message=e)
+            raise DocumentIndexingError(e)
 
         return {
             "doc_id": doc_id,
@@ -122,7 +193,7 @@ class DocumentService:
                             }
                         )
                 except Exception as e:
-                    raise StreamError(message=e)
+                    raise StreamError(e)
 
             if actions:
                 await async_bulk(es, actions, chunk_size=100, request_timeout=60)
@@ -141,3 +212,90 @@ class DocumentService:
                     "metadata": {"created_at": doc.created_at.isoformat()},
                 },
             )
+
+    async def query_documents(
+        self, es: AsyncElasticsearch, q: str
+    ) -> list[DocumentSearchResult]:
+        page_query = {"match": {"text": {"query": q, "fuzziness": "AUTO"}}}
+        highlight = {"fields": {"text": {}, "title": {}}}
+        _source_pages = ["doc_id", "page", "text", "metadata"]
+
+        page_res = await es.search(
+            index=PAGES_INDEX,
+            query=page_query,
+            highlight=highlight,
+            _source=_source_pages,
+            size=100,
+        )
+
+        grouped = defaultdict(
+            lambda: {
+                "doc_id": None,
+                "sub": None,
+                "filename": None,
+                "author": None,
+                "title": None,
+                "download_link": None,
+                "metadata": {},
+                "matching_pages": [],
+                "title_match": False,
+            }
+        )
+
+        doc_ids = set()
+
+        for hit in page_res["hits"]["hits"]:
+            doc = hit["_source"]
+            highlights = hit.get("highlight", {})
+            doc_id = doc["doc_id"]
+
+            grouped[doc_id]["doc_id"] = doc_id
+            grouped[doc_id]["matching_pages"].append(
+                DocumentPage(
+                    doc_id=doc_id,
+                    page=doc["page"],
+                    text=doc["text"],
+                    metadata=doc.get("metadata", {}),
+                    highlight=highlights,
+                )
+            )
+
+            doc_ids.add(doc_id)
+
+        if doc_ids:
+            doc_query = {"terms": {"doc_id": list(doc_ids)}}
+
+            _source_docs = [
+                "doc_id",
+                "title",
+                "author",
+                "filename",
+                "download_link",
+                "metadata",
+                "sub",
+            ]
+
+            doc_res = await es.search(
+                index=DOCS_INDEX,
+                query=doc_query,
+                highlight=highlight,
+                _source=_source_docs,
+                size=100,
+            )
+
+            for hit in doc_res["hits"]["hits"]:
+                source = hit["_source"]
+                doc_id = source["doc_id"]
+
+                grouped[doc_id]["doc_id"] = doc_id
+                grouped[doc_id]["title"] = source.get("title")
+                grouped[doc_id]["download_link"] = source.get("download_link")
+                grouped[doc_id]["metadata"] = source.get("metadata", {})
+                grouped[doc_id]["author"] = source.get("author")
+                grouped[doc_id]["filename"] = source.get("filename")
+                grouped[doc_id]["sub"] = source.get("sub")
+
+                if "highlight" in hit and "title" in hit["highlight"]:
+                    grouped[doc_id]["title_match"] = True
+
+        return list(grouped.values())

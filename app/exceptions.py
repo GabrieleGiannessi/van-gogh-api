@@ -11,3 +11,6 @@ class PDFExtractionError(Exception):
 
 class StreamError(Exception): 
     pass
+
+class DocumentDeleteError(Exception):
+    pass

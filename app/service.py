@@ -2,9 +2,12 @@
 from collections import defaultdict
 from datetime import datetime, timezone
 from io import BytesIO
+import io
 from uuid import uuid4
 from fastapi import HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from gridfs import NoFile
+from pdf2image import convert_from_bytes
 import pdfplumber
 from app.models import (
     DocumentCreateMetadata,
@@ -20,22 +23,16 @@ from app.exceptions import (
     DocumentCreationError,
     DocumentIndexingError,
     DocumentDeleteError,
+    DocumentNotFound,
+    PreviewException,
     StreamError,
 )
-import pprint
 
 DOCS_INDEX = "docs"
 PAGES_INDEX = "pages"
 
 
 class DocumentService:
-    #
-    # TODO:
-    #       - spostare la logica di business da `routes.py` a questo servizio
-    #       - importare tramite dependency injection il servizio nelle route
-    #       - logica di modifica del documento
-    #
-    #
 
     async def get_documents(self, es: AsyncElasticsearch) -> list[DocumentRead]:
         try:
@@ -133,7 +130,7 @@ class DocumentService:
                     chunk = await file.read(1024 * 1024)
                     if not chunk:
                         break
-                    await grid_in.write(chunk) 
+                    await grid_in.write(chunk)
         except Exception as e:
             await fs.delete(grid_in._id)
             raise DocumentCreationError(e)
@@ -299,3 +296,41 @@ class DocumentService:
                     grouped[doc_id]["title_match"] = True
 
         return list(grouped.values())
+
+    async def get_download_document(
+        self, fs: AsyncGridFSBucket, doc_id: str
+    ) -> StreamingResponse:
+        try:
+            file = await fs.open_download_stream(doc_id)
+        except NoFile as e:
+            raise DocumentNotFound(e)
+        except Exception as e: 
+            return Exception(e)
+
+        headers = {"Content-Disposition": f'attachment; filename="{file.filename}"'}
+
+        return StreamingResponse(file, media_type="application/pdf", headers=headers)
+
+    async def get_preview_document(
+        self, fs: AsyncGridFSBucket, doc_id: str, preview_size: int =1024*1024
+    ) -> StreamingResponse:
+        try:
+            file = await fs.open_download_stream(doc_id)
+            content = await file.read()
+        except NoFile as n:
+            raise DocumentNotFound(n)
+        except Exception as e: 
+            return Exception(e)
+        
+        pages = convert_from_bytes(content, first_page=1, last_page=1)
+        if not pages:
+            raise PreviewException
+            
+        img = pages[0]
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format="PNG")
+        img_bytes.seek(0)
+        
+        return StreamingResponse(img_bytes, media_type="image/png")
+        
+    

@@ -14,3 +14,9 @@ class StreamError(Exception):
 
 class DocumentDeleteError(Exception):
     pass
+
+class DocumentNotFound(Exception):
+    pass
+
+class PreviewException(Exception):
+    pass

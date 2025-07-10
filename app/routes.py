@@ -21,11 +21,18 @@ from app.dependency import (
     fs_dependency,
     document_service_dependency,
 )
-from app.models import DocumentCreateMetadata, DocumentPage, DocumentRead, DocumentSearchResult
+from app.models import (
+    DocumentCreateMetadata,
+    DocumentPage,
+    DocumentRead,
+    DocumentSearchResult,
+)
 from app.exceptions import (
     DocumentCreationError,
     DocumentDeleteError,
     DocumentIndexingError,
+    DocumentNotFound,
+    PreviewException,
     StreamError,
 )
 
@@ -42,12 +49,14 @@ async def upload_pdf(
     sub: str = Form(...),
     title: str = Form(...),
     author: str = Form(...),
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
 ):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="File must be a PDF.")
 
-    doc = DocumentCreateMetadata(sub=sub,title=title,author=author, filename=file.filename)
+    doc = DocumentCreateMetadata(
+        sub=sub, title=title, author=author, filename=file.filename
+    )
 
     try:
         res = await service.create_document(fs, es, doc, file)
@@ -76,6 +85,7 @@ async def get_all_documents(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving docs: {e}")
 
+
 @router.get("/documents/{doc_id}/pages", response_model=list[DocumentPage])
 async def get_pages_by_doc_id(
     service: document_service_dependency, es: elasticSearch_dependency, doc_id: str
@@ -87,6 +97,7 @@ async def get_pages_by_doc_id(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving pages: {e}")
 
+
 @router.get("/documents/sub/{sub}", response_model=list[DocumentRead])
 async def get_docs_by_sub(
     service: document_service_dependency, es: elasticSearch_dependency, sub: str
@@ -97,6 +108,7 @@ async def get_docs_by_sub(
         raise HTTPException(status_code=500, detail=f"Error indexing doc: {di}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving doc: {e}")
+
 
 @router.get("/search", response_model=list[DocumentSearchResult])
 async def search_text(
@@ -127,41 +139,31 @@ async def delete_document(
             status_code=500, detail=f"Stream error while deleting doc: {s}"
         )
 
-# @router.get("/download/{doc_id}")
-# async def download_document(doc_id: str, download: bool = True):
-#     try:
-#         file = await fs.open_download_stream(doc_id)
-#         content = await file.read()
-#     except NoFile:
-#         raise HTTPException(status_code=404, detail="File not found")
 
-#     disposition = "attachment" if download else "inline"
-#     headers = {"Content-Disposition": f'{disposition}; filename="{file.filename}"'}
-#     return StreamingResponse(
-#         io.BytesIO(content), media_type="application/pdf", headers=headers
-#     )
+@router.get("/download/{doc_id}")
+async def download_document(
+    service: document_service_dependency,
+    fs: fs_dependency,
+    doc_id: str,
+    download: bool = True,
+):
+    if download:
+        return await service.get_download_document(fs, doc_id)
+
+    raise HTTPException(status_code=400, detail="Download failed")
 
 
-# @router.get("/preview/{file_id}")
-# async def preview_pdf(doc_id: str):
-#     try:
-#         grid_out = await fs.open_download_stream(doc_id)
-#         content = await grid_out.read()  # ✅ Serve await per leggere i bytes!
-#     except NoFile:
-#         raise HTTPException(status_code=404, detail="File not found")
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Error accessing file: {e}")
-
-#     try:
-#         images = convert_from_bytes(content, first_page=1, last_page=1)
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"PDF conversion error: {e}")
-
-#     if not images:
-#         raise HTTPException(status_code=500, detail="Unable to create preview")
-
-#     img_bytes = io.BytesIO()
-#     images[0].save(img_bytes, format="PNG")
-#     img_bytes.seek(0)
-
-#     return StreamingResponse(img_bytes, media_type="image/png")
+@router.get("/preview/{doc_id}")
+async def preview_pdf(
+    service: document_service_dependency,
+    fs: fs_dependency,
+    doc_id: str,
+):
+    try:
+        return await service.get_preview_document(fs, doc_id)
+    except DocumentNotFound: 
+        raise HTTPException (status_code=404, detail="Document not found")
+    except PreviewException: 
+        raise HTTPException (status_code=404, detail="Error loading preview")
+    except Exception as e: 
+        raise HTTPException (status_code=500, detail=f"Server error: {e}")

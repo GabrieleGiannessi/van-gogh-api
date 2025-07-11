@@ -1,5 +1,5 @@
 from elasticsearch import AsyncElasticsearch
-from fastapi import Depends
+from fastapi import Depends, Request
 from typing import Annotated
 
 from gridfs import AsyncGridFSBucket
@@ -9,8 +9,8 @@ from app.service import DocumentService
 
 settings = Settings()
 
-def get_es_client():
-    return AsyncElasticsearch(settings.es_host)
+def get_es_client(request: Request):
+    return request.app.state.es 
 
 
 def get_mongo_client():

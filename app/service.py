@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 import io
 from uuid import uuid4
-from fastapi import HTTPException, UploadFile
+from fastapi import UploadFile
 from fastapi.responses import StreamingResponse
 from gridfs import NoFile
 from pdf2image import convert_from_bytes
@@ -15,6 +15,7 @@ from app.models import (
     DocumentPage,
     IndexedDocument,
     DocumentSearchResult,
+    PartialDocument,
 )
 from elasticsearch import AsyncElasticsearch
 from gridfs.asynchronous import AsyncGridFSBucket
@@ -54,7 +55,7 @@ class DocumentService:
 
     async def get_document_by_id(
         self, es: AsyncElasticsearch, doc_id: str
-    ) -> DocumentRead | None:
+    ) -> DocumentRead:
         try:
             res = await es.search(
                 index=DOCS_INDEX,
@@ -63,7 +64,7 @@ class DocumentService:
             )
             hits = res["hits"]["hits"]
             if not hits:
-                return None
+                return DocumentNotFound
             return DocumentRead(**hits[0]["_source"])
         except Exception as e:
             raise DocumentIndexingError(e)
@@ -296,9 +297,36 @@ class DocumentService:
                     grouped[doc_id]["title_match"] = True
 
         return list(grouped.values())
+    
+    async def update_document(self, es: AsyncElasticsearch, doc_id: str, metadata: PartialDocument) -> None : 
+        try:
+            res = await es.search(
+                index=DOCS_INDEX,
+                query={"term": {"doc_id": doc_id}},
+                size=1,
+            )
+            hits = res["hits"]["hits"]
+            if not hits:
+                raise DocumentNotFound
+
+            es_id = hits[0]["_id"]  # ID interno di Elasticsearch per l'update
+            update_fields = metadata.model_dump(exclude_unset=True)
+
+            if not update_fields:
+                return  # niente da aggiornare
+
+            await es.update(
+                index=DOCS_INDEX,
+                id=es_id,
+                body={"doc": update_fields}
+            )
+        
+        except Exception as e:
+            raise DocumentIndexingError(e)
+
 
     async def get_download_document(
-        self, fs: AsyncGridFSBucket, doc_id: str
+        self, fs: AsyncGridFSBucket, doc_id: str, download: bool
     ) -> StreamingResponse:
         try:
             file = await fs.open_download_stream(doc_id)
@@ -307,7 +335,10 @@ class DocumentService:
         except Exception as e: 
             return Exception(e)
 
-        headers = {"Content-Disposition": f'attachment; filename="{file.filename}"'}
+        if download:
+            headers = {"Content-Disposition": f'attachment; filename="{file.filename}"'}
+        else:
+           headers = {"Content-Disposition": f'inline; filename="{file.filename}"'}
 
         return StreamingResponse(file, media_type="application/pdf", headers=headers)
 

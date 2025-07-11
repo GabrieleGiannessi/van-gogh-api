@@ -10,6 +10,7 @@ from fastapi import (
     Form,
     HTTPException,
     Query,
+    Response,
     UploadFile,
 )
 
@@ -26,6 +27,7 @@ from app.models import (
     DocumentPage,
     DocumentRead,
     DocumentSearchResult,
+    PartialDocument,
 )
 from app.exceptions import (
     DocumentCreationError,
@@ -85,6 +87,19 @@ async def get_all_documents(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving docs: {e}")
 
+
+@router.get("/documents/{doc_id}", response_model=DocumentRead)
+async def get_document_by_id(
+    service: document_service_dependency, es: elasticSearch_dependency, doc_id: str
+):
+    try:
+        return await service.get_document_by_id(es, doc_id)
+    except DocumentNotFound: 
+        raise HTTPException(status_code=404, detail=f"Document not found")
+    except DocumentIndexingError as di:
+        raise HTTPException(status_code=500, detail=f"Error indexing docs: {di}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving docs: {e}")
 
 @router.get("/documents/{doc_id}/pages", response_model=list[DocumentPage])
 async def get_pages_by_doc_id(
@@ -147,10 +162,10 @@ async def download_document(
     doc_id: str,
     download: bool = True,
 ):
-    if download:
-        return await service.get_download_document(fs, doc_id)
-
-    raise HTTPException(status_code=400, detail="Download failed")
+    try: 
+        return await service.get_download_document(fs, doc_id, download)
+    except Exception as e: 
+        raise HTTPException(status_code=500, detail="Download failed")
 
 
 @router.get("/preview/{doc_id}")
@@ -161,9 +176,26 @@ async def preview_pdf(
 ):
     try:
         return await service.get_preview_document(fs, doc_id)
+    except DocumentNotFound:
+        raise HTTPException(status_code=404, detail="Document not found")
+    except PreviewException:
+        raise HTTPException(status_code=404, detail="Error loading preview")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
+
+
+@router.patch("/documents/{doc_id}")
+async def modify_document(
+    service: document_service_dependency, es: elasticSearch_dependency, doc_id: str, metadata: PartialDocument
+): 
+    
+    try: 
+        await service.update_document(es, doc_id, metadata)
+    except DocumentIndexingError as di: 
+        raise HTTPException (status_code=500, detail=f"Error while retrieving doc: {di} ")
     except DocumentNotFound: 
-        raise HTTPException (status_code=404, detail="Document not found")
-    except PreviewException: 
-        raise HTTPException (status_code=404, detail="Error loading preview")
+        raise HTTPException(status_code=404, detail="Not found")
     except Exception as e: 
-        raise HTTPException (status_code=500, detail=f"Server error: {e}")
+        raise HTTPException (status_code=500, detail=f"Server error: {e} ")
+    
+    return Response(status_code=204)

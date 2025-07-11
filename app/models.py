@@ -12,6 +12,10 @@ class DocumentCreateMetadata(BaseModel):
     author: str 
     filename: str
     
+class PartialDocument(BaseModel): 
+    title: Optional[str] = None
+    author: Optional[str] = None
+    
 class DocumentRead(BaseModel):
     doc_id: str 
     sub: str 

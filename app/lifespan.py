@@ -50,6 +50,7 @@ async def init_indices(es: AsyncElasticsearch):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     es = AsyncElasticsearch(settings.es_host)
+    app.state.es = es
     await init_indices(es)
     yield
     await es.close()

@@ -1,11 +1,8 @@
-from contextlib import asynccontextmanager
-import io
 import logging
-from collections import defaultdict
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
+    Depends,
     File,
     Form,
     HTTPException,
@@ -14,9 +11,9 @@ from fastapi import (
     UploadFile,
 )
 
-from fastapi.responses import JSONResponse, StreamingResponse
-from gridfs import NoFile
-from pdf2image import convert_from_bytes
+from fastapi.responses import JSONResponse
+
+from app.auth.keycloak import verify_token
 from app.dependency import (
     elasticSearch_dependency,
     fs_dependency,
@@ -90,16 +87,17 @@ async def get_all_documents(
 
 @router.get("/documents/{doc_id}", response_model=DocumentRead)
 async def get_document_by_id(
-    service: document_service_dependency, es: elasticSearch_dependency, doc_id: str
+    service: document_service_dependency, es: elasticSearch_dependency, doc_id: str, token = Depends(verify_token)
 ):
     try:
         return await service.get_document_by_id(es, doc_id)
-    except DocumentNotFound: 
+    except DocumentNotFound:
         raise HTTPException(status_code=404, detail=f"Document not found")
     except DocumentIndexingError as di:
         raise HTTPException(status_code=500, detail=f"Error indexing docs: {di}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving docs: {e}")
+
 
 @router.get("/documents/{doc_id}/pages", response_model=list[DocumentPage])
 async def get_pages_by_doc_id(
@@ -162,9 +160,9 @@ async def download_document(
     doc_id: str,
     download: bool = True,
 ):
-    try: 
+    try:
         return await service.get_download_document(fs, doc_id, download)
-    except Exception as e: 
+    except Exception as e:
         raise HTTPException(status_code=500, detail="Download failed")
 
 
@@ -186,16 +184,21 @@ async def preview_pdf(
 
 @router.patch("/documents/{doc_id}")
 async def modify_document(
-    service: document_service_dependency, es: elasticSearch_dependency, doc_id: str, metadata: PartialDocument
-): 
-    
-    try: 
+    service: document_service_dependency,
+    es: elasticSearch_dependency,
+    doc_id: str,
+    metadata: PartialDocument,
+):
+
+    try:
         await service.update_document(es, doc_id, metadata)
-    except DocumentIndexingError as di: 
-        raise HTTPException (status_code=500, detail=f"Error while retrieving doc: {di} ")
-    except DocumentNotFound: 
+    except DocumentIndexingError as di:
+        raise HTTPException(
+            status_code=500, detail=f"Error while retrieving doc: {di} "
+        )
+    except DocumentNotFound:
         raise HTTPException(status_code=404, detail="Not found")
-    except Exception as e: 
-        raise HTTPException (status_code=500, detail=f"Server error: {e} ")
-    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {e} ")
+
     return Response(status_code=204)

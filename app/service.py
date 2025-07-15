@@ -124,7 +124,7 @@ class DocumentService:
             async with fs.open_upload_stream_with_id(
                 doc_id,
                 metadata.filename,
-                chunk_size_bytes=4,
+                chunk_size_bytes=1024 * 256,
                 metadata={"contentType": "application/pdf"},
             ) as grid_in:
                 while True:
@@ -194,7 +194,7 @@ class DocumentService:
                     raise StreamError(e)
 
             if actions:
-                await async_bulk(es, actions, chunk_size=100, request_timeout=60)
+                await async_bulk(es, actions, chunk_size=100, request_timeout=120)
 
             await es.index(
                 index=DOCS_INDEX,

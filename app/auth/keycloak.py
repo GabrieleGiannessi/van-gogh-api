@@ -1,40 +1,72 @@
 import httpx
 from jose import jwt, JWTError
 from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from typing import Dict
-
-KEYCLOAK_URL = "http://localhost:8080" #server
+KEYCLOAK_URL = "http://localhost:8080"
 REALM_URI = f"{KEYCLOAK_URL}/realms/master"
 ALGORITHM = "RS256"
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
-# Cache della chiave pubblica
+oauth2_scheme = HTTPBearer()
 jwks_cache = {}
 
-async def get_public_key():
+# ===== Utils =====
+
+
+async def get_public_keys():
     if not jwks_cache.get("keys"):
         async with httpx.AsyncClient() as client:
             resp = await client.get(f"{REALM_URI}/protocol/openid-connect/certs")
             if resp.status_code != 200:
-                raise RuntimeError("Impossibile recuperare le chiavi pubbliche da Keycloak.")
+                raise RuntimeError(
+                    "Impossibile recuperare le chiavi pubbliche da Keycloak."
+                )
             jwks_cache["keys"] = resp.json()["keys"]
     return jwks_cache["keys"]
 
-async def verify_token(token: str = Depends(oauth2_scheme)) -> Dict:
-    keys = await get_public_key()
-    
+
+async def verify_token(
+    credentials: HTTPAuthorizationCredentials = Depends(oauth2_scheme),
+) -> dict:
+    token = credentials.credentials
+    keys = await get_public_keys()
+
     for key in keys:
         try:
-            public_key = jwt.construct_rsa_public_key(key)
-            payload = jwt.decode(token, public_key, algorithms=[ALGORITHM], options={"verify_aud": False})
+            payload = jwt.decode(
+                token,
+                key,
+                algorithms=[ALGORITHM],
+                options={"verify_aud": False},  # Imposta a True se vuoi verificare aud
+            )
             return payload
         except JWTError:
-            continue  # Prova con la prossima chiave se ce ne sono più di una
+            continue  # Prova la prossima chiave
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Token non valido o firma non verificabile",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+
+def has_role_in_client(payload: dict, client: str, role: str) -> bool:
+    """
+    Verifica se l'utente ha un determinato ruolo in uno specifico client Keycloak.
+
+    :param payload: Il dizionario decodificato del token JWT.
+    :param client: Il nome del client (es. 'van-gogh-dna').
+    :param role: Il ruolo da cercare (es. 'van-gogh-admin').
+    :return: True se l'utente ha quel ruolo nel client, False altrimenti.
+    """
+    roles = payload.get("resource_access", {}).get(client, {}).get("roles", [])
+    return role in roles
+
+
+async def require_admin(token_data: dict = Depends(verify_token)) -> dict:
+    if not has_role_in_client(token_data, "van-gogh-dna", "van_gogh_admin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permessi insufficienti: ruolo van-gogh-admin richiesto.",
+        )
+        
+    return token_data

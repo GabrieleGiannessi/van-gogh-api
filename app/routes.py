@@ -8,12 +8,12 @@ from fastapi import (
     HTTPException,
     Query,
     Response,
-    UploadFile,
+    UploadFile, 
 )
 
 from fastapi.responses import JSONResponse
 
-from app.auth.keycloak import verify_token
+from app.auth.keycloak import require_admin
 from app.dependency import (
     elasticSearch_dependency,
     fs_dependency,
@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+@router.get("/me/")
+async def get_users_me(payload: dict = Depends(require_admin)):
+    return {"user": payload}
+
 @router.post("/upload/")
 async def upload_pdf(
     fs: fs_dependency,
@@ -49,6 +53,7 @@ async def upload_pdf(
     title: str = Form(...),
     author: str = Form(...),
     file: UploadFile = File(...),
+    token: dict = Depends(require_admin)
 ):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="File must be a PDF.")
@@ -87,7 +92,7 @@ async def get_all_documents(
 
 @router.get("/documents/{doc_id}", response_model=DocumentRead)
 async def get_document_by_id(
-    service: document_service_dependency, es: elasticSearch_dependency, doc_id: str, token = Depends(verify_token)
+    service: document_service_dependency, es: elasticSearch_dependency, doc_id: str
 ):
     try:
         return await service.get_document_by_id(es, doc_id)
@@ -138,6 +143,7 @@ async def delete_document(
     es: elasticSearch_dependency,
     service: document_service_dependency,
     doc_id: str,
+    token_data: dict = Depends(require_admin)
 ):
     try:
         return await service.delete_document_by_id(fs, es, doc_id)

@@ -3,6 +3,10 @@ from typing import Optional
 from fastapi import Form, File
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
 class Metadata (BaseModel):
     created_at: str
     
@@ -34,6 +38,7 @@ class DocumentPage (BaseModel):
     
 class IndexedDocument (BaseModel): 
     doc_id: str 
+    path: str
     sub: str 
     title: str 
     author: str 
@@ -52,5 +57,5 @@ class DocumentSearchResult(BaseModel):
     matching_pages: list[DocumentPage] = []
     
 class Settings(BaseSettings):
-    mongo_uri: str = "mongodb://localhost:27017"
-    es_host: str = "http://localhost:9200"
+    mongo_uri: str = os.environ["MONGO_URI"]
+    es_host: str = os.environ["ES_HOST"]

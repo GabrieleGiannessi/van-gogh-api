@@ -117,9 +117,24 @@ class DocumentService:
         metadata: DocumentCreateMetadata,
         file: UploadFile,
     ):
+        
+        from app.worker import index_document_task_sync
 
         doc_id = str(uuid4())
+        temp_path = f"/tmp/{doc_id}.pdf"
+        
+        #Salvo in FS (Per indicizzazione)
+        try:
+            with open(temp_path, "wb") as out_file:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out_file.write(chunk)
+        except Exception as e:
+            raise DocumentCreationError(f"Errore durante il salvataggio temporaneo: {e}")
 
+        #Salvo in GridFS
         try:
             async with fs.open_upload_stream_with_id(
                 doc_id,
@@ -136,80 +151,76 @@ class DocumentService:
             await fs.delete(grid_in._id)
             raise DocumentCreationError(e)
 
-        try:
-            await self.index_document(
-                fs,
-                es,
-                IndexedDocument(
-                    doc_id=doc_id,
-                    sub=metadata.sub,
-                    title=metadata.title,
-                    author=metadata.author,
-                    filename=metadata.filename,
-                    created_at=datetime.now(timezone.utc),
-                ),
+        index_document_task_sync.delay(
+            IndexedDocument(
+                doc_id=doc_id,
+                path=temp_path,
+                sub=metadata.sub,
+                title=metadata.title,
+                author=metadata.author,
+                filename=metadata.filename,
+                created_at=datetime.now(timezone.utc),
             )
-        except Exception as e:
-            raise DocumentIndexingError(e)
-
+        )
+        
         return {
             "doc_id": doc_id,
-            "message": "File uploaded and indexed.",
+            "message": "File uploaded, indexing in progress.",
             "download_link": f"/download/{doc_id}",
         }
 
-    async def index_document(
-        self, fs: AsyncGridFSBucket, es: AsyncElasticsearch, doc: IndexedDocument
-    ) -> None:
-        try:
-            grid_out = await fs.open_download_stream(
-                doc.doc_id
-            )  # Prendo i dati dal db riferiti dall' _id del documento
-            content = await grid_out.read()
-        except Exception as e:
-            raise StreamError(message=e)
+    # async def index_document(
+    #     self, fs: AsyncGridFSBucket, es: AsyncElasticsearch, doc: IndexedDocument
+    # ) -> None:
+    #     try:
+    #         grid_out = await fs.open_download_stream(
+    #             doc.doc_id
+    #         )  # Prendo i dati dal db riferiti dall' _id del documento
+    #         content = await grid_out.read()
+    #     except Exception as e:
+    #         raise StreamError(message=e)
 
-        with pdfplumber.open(BytesIO(content)) as pdf:
-            actions = []
-            for i, page in enumerate(pdf.pages):
-                try:
-                    text = (page.extract_text() or "").strip()
-                    if text:
-                        actions.append(
-                            {
-                                "_op_type": "index",
-                                "_index": PAGES_INDEX,
-                                "_id": f"{doc.doc_id}_page_{i+1}",
-                                "_source": {
-                                    "doc_id": doc.doc_id,
-                                    "page": i + 1,
-                                    "text": text,
-                                    "metadata": {
-                                        "created_at": doc.created_at.isoformat()
-                                    },
-                                },
-                            }
-                        )
-                except Exception as e:
-                    raise StreamError(e)
+    #     with pdfplumber.open(BytesIO(content)) as pdf:
+    #         actions = []
+    #         for i, page in enumerate(pdf.pages):
+    #             try:
+    #                 text = (page.extract_text() or "").strip()
+    #                 if text:
+    #                     actions.append(
+    #                         {
+    #                             "_op_type": "index",
+    #                             "_index": PAGES_INDEX,
+    #                             "_id": f"{doc.doc_id}_page_{i+1}",
+    #                             "_source": {
+    #                                 "doc_id": doc.doc_id,
+    #                                 "page": i + 1,
+    #                                 "text": text,
+    #                                 "metadata": {
+    #                                     "created_at": doc.created_at.isoformat()
+    #                                 },
+    #                             },
+    #                         }
+    #                     )
+    #             except Exception as e:
+    #                 raise StreamError(e)
 
-            if actions:
-                await async_bulk(es, actions, chunk_size=100, request_timeout=120)
+    #         if actions:
+    #             await async_bulk(es, actions, chunk_size=100, request_timeout=120)
 
-            await es.index(
-                index=DOCS_INDEX,
-                id=doc.doc_id,
-                body={
-                    "doc_id": doc.doc_id,
-                    "sub": doc.sub,
-                    "title": doc.title,
-                    "author": doc.author,
-                    "filename": doc.filename,
-                    "download_link": f"/download/{doc.doc_id}",
-                    "num_pages": len(pdf.pages),
-                    "metadata": {"created_at": doc.created_at.isoformat()},
-                },
-            )
+    #         await es.index(
+    #             index=DOCS_INDEX,
+    #             id=doc.doc_id,
+    #             body={
+    #                 "doc_id": doc.doc_id,
+    #                 "sub": doc.sub,
+    #                 "title": doc.title,
+    #                 "author": doc.author,
+    #                 "filename": doc.filename,
+    #                 "download_link": f"/download/{doc.doc_id}",
+    #                 "num_pages": len(pdf.pages),
+    #                 "metadata": {"created_at": doc.created_at.isoformat()},
+    #             },
+    #         )
 
     async def query_documents(
         self, es: AsyncElasticsearch, q: str
@@ -297,8 +308,10 @@ class DocumentService:
                     grouped[doc_id]["title_match"] = True
 
         return list(grouped.values())
-    
-    async def update_document(self, es: AsyncElasticsearch, doc_id: str, metadata: PartialDocument) -> None : 
+
+    async def update_document(
+        self, es: AsyncElasticsearch, doc_id: str, metadata: PartialDocument
+    ) -> None:
         try:
             res = await es.search(
                 index=DOCS_INDEX,
@@ -315,15 +328,10 @@ class DocumentService:
             if not update_fields:
                 return  # niente da aggiornare
 
-            await es.update(
-                index=DOCS_INDEX,
-                id=es_id,
-                body={"doc": update_fields}
-            )
-        
+            await es.update(index=DOCS_INDEX, id=es_id, body={"doc": update_fields})
+
         except Exception as e:
             raise DocumentIndexingError(e)
-
 
     async def get_download_document(
         self, fs: AsyncGridFSBucket, doc_id: str, download: bool
@@ -332,36 +340,34 @@ class DocumentService:
             file = await fs.open_download_stream(doc_id)
         except NoFile as e:
             raise DocumentNotFound(e)
-        except Exception as e: 
+        except Exception as e:
             return Exception(e)
 
         if download:
             headers = {"Content-Disposition": f'attachment; filename="{file.filename}"'}
         else:
-           headers = {"Content-Disposition": f'inline; filename="{file.filename}"'}
+            headers = {"Content-Disposition": f'inline; filename="{file.filename}"'}
 
         return StreamingResponse(file, media_type="application/pdf", headers=headers)
 
     async def get_preview_document(
-        self, fs: AsyncGridFSBucket, doc_id: str, preview_size: int =1024*1024
+        self, fs: AsyncGridFSBucket, doc_id: str, preview_size: int = 1024 * 1024
     ) -> StreamingResponse:
         try:
             file = await fs.open_download_stream(doc_id)
             content = await file.read()
         except NoFile as n:
             raise DocumentNotFound(n)
-        except Exception as e: 
+        except Exception as e:
             return Exception(e)
-        
+
         pages = convert_from_bytes(content, first_page=1, last_page=1)
         if not pages:
             raise PreviewException
-            
+
         img = pages[0]
         img_bytes = io.BytesIO()
         img.save(img_bytes, format="PNG")
         img_bytes.seek(0)
-        
+
         return StreamingResponse(img_bytes, media_type="image/png")
-        
-    

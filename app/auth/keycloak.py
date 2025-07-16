@@ -2,10 +2,16 @@ import httpx
 from jose import jwt, JWTError
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from dotenv import load_dotenv
+import os
 
-KEYCLOAK_URL = "http://localhost:8080"
-REALM_URI = f"{KEYCLOAK_URL}/realms/master"
-ALGORITHM = "RS256"
+load_dotenv() 
+
+KEYCLOAK_URL = os.environ["KEYCLOAK_URL"]
+REALM = os.environ["REALM_RELATIVE_PATH"]
+ALGORITHM = os.environ["ALGORITHM"]
+REALM_URI = f"{KEYCLOAK_URL}{REALM}"
+
 oauth2_scheme = HTTPBearer()
 jwks_cache = {}
 

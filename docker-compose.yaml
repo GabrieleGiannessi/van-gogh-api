@@ -4,16 +4,16 @@ services:
     container_name: elasticsearch
     environment:
       - discovery.type=single-node
-      - xpack.security.enabled=false  # Disattiva l'autenticazione per test
-      - ES_JAVA_OPTS=-Xms2g -Xmx2g # Si imposta un limite alla dimensione dello heap del container (almeno 50%) 
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms2g -Xmx2g
     ports:
       - 9200:9200
     volumes:
       - esdata:/usr/share/elasticsearch/data
     networks:
       - backend
-    
-  mongodb: 
+
+  mongodb:
     image: mongodb/mongodb-community-server:latest
     ports:
       - "27017:27017"
@@ -21,7 +21,7 @@ services:
       - mongodata:/data/db
     networks:
       - backend
-    
+
   postgres:
     image: postgres:15
     container_name: keycloak_postgres
@@ -55,11 +55,52 @@ services:
     networks:
       - backend
 
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - backend
+    volumes:
+      - redisdata:/data
+
+  celery:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: celery_worker
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    command: celery -A app.worker.celery_app worker --loglevel=info
+    depends_on:
+      - redis
+      - elasticsearch
+      - mongodb
+    networks:
+      - backend
+
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fastapi_app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+      - mongodb
+      - elasticsearch
+      - keycloak
+    networks:
+      - backend
 
 volumes:
   esdata:
   mongodata:
   pgdata:
+  redisdata: 
 
 networks:
   backend:

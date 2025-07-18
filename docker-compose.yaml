@@ -13,12 +13,18 @@ services:
     networks:
       - backend
 
-  mongodb:
-    image: mongodb/mongodb-community-server:latest
+  minio:
+    image: minio/minio
+    container_name: minio
     ports:
-      - "27017:27017"
+      - "9000:9000"    # API S3 compatibile
+      - "9001:9001"    # Console Web
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
     volumes:
-      - mongodata:/data/db
+      - minio_data:/data
+    command: server /data --console-address ":9001"
     networks:
       - backend
 
@@ -72,11 +78,12 @@ services:
     container_name: celery_worker
     environment:
       - CELERY_BROKER_URL=redis://redis:6379/0
+      - DOCS_INDEX=docs
+      - PAGES_INDEX=pages
     command: celery -A app.worker.celery_app worker --loglevel=info
     depends_on:
       - redis
       - elasticsearch
-      - mongodb
     networks:
       - backend
 
@@ -84,13 +91,25 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: fastapi_app
+    container_name: api
+    environment:
+      DOCS_INDEX: docs
+      PAGES_INDEX: pages
+      MINIO_CLIENT_URL: http://minio:9000
+      ES_HOST: http://elasticsearch:9200
+      CELERY_BROKER_URL: redis://redis:6379/0
+      KEYCLOAK_URL: http://keycloak:8080
+      REALM_RELATIVE_PATH: /realms/master
+      ALGORITHM: RS256
+      BUCKET: van-gogh-docs
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
     ports:
       - "8000:8000"
     depends_on:
       - redis
-      - mongodb
+      - minio
       - elasticsearch
       - keycloak
     networks:
@@ -98,7 +117,7 @@ services:
 
 volumes:
   esdata:
-  mongodata:
+  minio_data:
   pgdata:
   redisdata: 
 

@@ -4,28 +4,24 @@ import os
 from io import BytesIO
 from celery import Celery
 import pdfplumber
-from app.clients import create_es_client, create_mongo_client
-from gridfs import AsyncGridFSBucket
+from app.clients import create_es_client
 from elasticsearch.helpers import async_bulk
 from app.exceptions import StreamError
 from app.models import IndexedDocument
-from app.services.docs import DOCS_INDEX, PAGES_INDEX
 
+DOCS_INDEX = os.getenv("DOCS_INDEX", "docs")
+PAGES_INDEX = os.getenv("PAGES_INDEX", "pages")
 broker_url = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
 celery_app = Celery("pdf_tasks", broker=broker_url)
 
 es = create_es_client()
-mongo_client = create_mongo_client()
-fs = AsyncGridFSBucket(mongo_client.documents_db, "documents")
-
 
 @celery_app.task
-def index_document_task_sync(doc: IndexedDocument):
-    asyncio.run(_index_document_task(doc))
+def index_document_task_sync(doc: dict):
+    asyncio.run(_index_document_task(IndexedDocument(**doc)))
 
 
 async def _index_document_task(doc: IndexedDocument):
-
     # utilizzo la stringa che identifica il file temporaneo salvato per l'indicizzazione
     try:
         with pdfplumber.open(doc.path) as pdf:

@@ -57,5 +57,5 @@ class DocumentSearchResult(BaseModel):
     matching_pages: list[DocumentPage] = []
     
 class Settings(BaseSettings):
-    mongo_uri: str = os.environ["MONGO_URI"]
+    minio_client: str = os.environ["MINIO_CLIENT_URL"]
     es_host: str = os.environ["ES_HOST"]

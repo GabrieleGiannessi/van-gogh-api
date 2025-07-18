@@ -3,4 +3,7 @@ run:
 
 exec: 
 	docker compose build --no-cache
-	docker compose up
+	docker compose up --remove-orphans
+
+requirements: 
+	pip freeze > requirements.txt

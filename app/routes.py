@@ -16,7 +16,6 @@ from fastapi.responses import JSONResponse
 from app.auth.keycloak import require_admin
 from app.dependency import (
     elasticSearch_dependency,
-    fs_dependency,
     document_service_dependency,
 )
 from app.models import (
@@ -46,8 +45,6 @@ async def get_users_me(payload: dict = Depends(require_admin)):
 
 @router.post("/upload/")
 async def upload_pdf(
-    fs: fs_dependency,
-    es: elasticSearch_dependency,
     service: document_service_dependency,
     sub: str = Form(...),
     title: str = Form(...),
@@ -63,17 +60,17 @@ async def upload_pdf(
     )
 
     try:
-        res = await service.create_document(fs, es, doc, file)
+        res = await service.create_document(doc, file)
     except DocumentIndexingError as di:
         raise HTTPException(status_code=500, detail=f"Error indexing document: {di} ")
     except DocumentCreationError as c:
         raise HTTPException(
-            status_code=500, detail=f"Error creating document in db: {c} "
+            status_code=500, detail=f"Document creation error: {c} "
         )
     except StreamError as s:
-        raise HTTPException(status_code=500, detail=f"Error streaming data: {s} ")
+        raise HTTPException(status_code=500, detail=f"Streaming error: {s} ")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error streaming data: {e} ")
+        raise HTTPException(status_code=500, detail=f"Error uploading file: {e} ")
 
     return JSONResponse(status_code=201, content=res)
 
@@ -139,14 +136,13 @@ async def search_text(
 
 @router.delete("/documents/{doc_id}", response_model=DocumentRead)
 async def delete_document(
-    fs: fs_dependency,
     es: elasticSearch_dependency,
     service: document_service_dependency,
     doc_id: str,
     token_data: dict = Depends(require_admin)
 ):
     try:
-        return await service.delete_document_by_id(fs, es, doc_id)
+        return await service.delete_document_by_id(es, doc_id)
     except DocumentDeleteError as de:
         raise HTTPException(status_code=500, detail=f"Error while removing doc: {de}")
     except DocumentIndexingError as di:
@@ -162,12 +158,11 @@ async def delete_document(
 @router.get("/download/{doc_id}")
 async def download_document(
     service: document_service_dependency,
-    fs: fs_dependency,
     doc_id: str,
     download: bool = True,
 ):
     try:
-        return await service.get_download_document(fs, doc_id, download)
+        return await service.get_download_document(doc_id, download)
     except Exception as e:
         raise HTTPException(status_code=500, detail="Download failed")
 
@@ -175,11 +170,10 @@ async def download_document(
 @router.get("/preview/{doc_id}")
 async def preview_pdf(
     service: document_service_dependency,
-    fs: fs_dependency,
     doc_id: str,
 ):
     try:
-        return await service.get_preview_document(fs, doc_id)
+        return await service.get_preview_document(doc_id)
     except DocumentNotFound:
         raise HTTPException(status_code=404, detail="Document not found")
     except PreviewException:

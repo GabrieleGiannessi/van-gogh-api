@@ -1,14 +1,15 @@
 # Service layer
 from collections import defaultdict
 from datetime import datetime, timezone
-from io import BytesIO
+from aiobotocore.session import AioSession
+from contextlib import AsyncExitStack
 import io
+import aiofiles
 from uuid import uuid4
 from fastapi import UploadFile
 from fastapi.responses import StreamingResponse
 from gridfs import NoFile
 from pdf2image import convert_from_bytes
-import pdfplumber
 from app.models import (
     DocumentCreateMetadata,
     DocumentRead,
@@ -19,7 +20,6 @@ from app.models import (
 )
 from elasticsearch import AsyncElasticsearch
 from gridfs.asynchronous import AsyncGridFSBucket
-from elasticsearch.helpers import async_bulk
 from app.exceptions import (
     DocumentCreationError,
     DocumentIndexingError,
@@ -28,9 +28,15 @@ from app.exceptions import (
     PreviewException,
     StreamError,
 )
+from app.clients import create_minio_s3_client
+from dotenv import load_dotenv
+import os
 
-DOCS_INDEX = "docs"
-PAGES_INDEX = "pages"
+load_dotenv()
+
+DOCS_INDEX = os.environ["DOCS_INDEX"]
+PAGES_INDEX = os.environ["PAGES_INDEX"]
+BUCKET = os.environ["BUCKET"]
 
 
 class DocumentService:
@@ -82,145 +88,105 @@ class DocumentService:
             raise DocumentIndexingError(e)
 
     async def delete_document_by_id(
-        self, fs: AsyncGridFSBucket, es: AsyncElasticsearch, doc_id: str
+        self,
+        es: AsyncElasticsearch,
+        doc_id: str,
     ) -> DocumentRead:
+        # Step 1: Elimina le pagine associate all'ID
         try:
             await es.delete_by_query(
                 index=PAGES_INDEX,
-                body={"query": {"match": {"doc_id": doc_id}}},
+                body={"query": {"term": {"doc_id": doc_id}}},
                 refresh=True,
                 wait_for_completion=True,
             )
-            try:
-                res = await es.get(index=DOCS_INDEX, id=doc_id)
-                doc_data = DocumentRead(**res["_source"])
-            except Exception as e:
-                raise DocumentIndexingError(e)
+        except Exception as e:
+            raise DocumentIndexingError(f"Errore durante delete_by_query: {e}")
 
+        # Step 2: Recupera i metadati per restituirli al chiamante
+        try:
+            res = await es.get(index=DOCS_INDEX, id=doc_id)
+            doc_data = DocumentRead(**res["_source"])
+        except Exception as e:
+            raise DocumentIndexingError(f"Errore nel recupero del documento: {e}")
+
+        # Step 3: Elimina l'indice del documento
+        try:
             await es.delete(index=DOCS_INDEX, id=doc_id, refresh=True)
-            try:
-                file = await fs.open_download_stream(doc_id)
-            except NoFile as e:
-                raise StreamError(e)
+        except Exception as e:
+            raise DocumentIndexingError(
+                f"Errore durante l'eliminazione del documento: {e}"
+            )
 
-            await fs.delete(file._id)
-
-            return doc_data
+        # Step 4: Elimina il file PDF da MinIO
+        try:
+            session = AioSession()
+            async with AsyncExitStack() as exit_stack:
+                s3_client = await create_minio_s3_client(session, exit_stack)
+                resp = await s3_client.delete_object(Bucket=BUCKET, Key=doc_id)
 
         except Exception as e:
-            raise DocumentDeleteError(e)
+            raise StreamError(f"Errore durante la rimozione del file da MinIO: {e}")
+
+        return resp
 
     async def create_document(
         self,
-        fs: AsyncGridFSBucket,
-        es: AsyncElasticsearch,
         metadata: DocumentCreateMetadata,
         file: UploadFile,
     ):
-        
+
         from app.worker import index_document_task_sync
 
         doc_id = str(uuid4())
-        temp_path = f"/tmp/{doc_id}.pdf"
-        
-        #Salvo in FS (Per indicizzazione)
-        try:
-            with open(temp_path, "wb") as out_file:
-                while True:
-                    chunk = await file.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    out_file.write(chunk)
-        except Exception as e:
-            raise DocumentCreationError(f"Errore durante il salvataggio temporaneo: {e}")
+        folder = "/tmp"
+        filename = f"/{doc_id}.pdf"
+        temp_path = f"{folder}{filename}"
+        key = f"/docs/{filename}"
 
-        #Salvo in GridFS
+        content = await file.read()
+        
+        # Salvo in FS (Per indicizzazione)
         try:
-            async with fs.open_upload_stream_with_id(
-                doc_id,
-                metadata.filename,
-                chunk_size_bytes=1024 * 256,
-                metadata={"contentType": "application/pdf"},
-            ) as grid_in:
-                while True:
-                    chunk = await file.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    await grid_in.write(chunk)
+            async with aiofiles.open(temp_path, "wb") as out_file:
+                await out_file.write(content)
         except Exception as e:
-            await fs.delete(grid_in._id)
-            raise DocumentCreationError(e)
+            raise DocumentCreationError(
+                f"Errore durante il salvataggio temporaneo: {e}"
+            )
+
+        # Salvo in object storage (minIO)
+        try:
+            session = AioSession()
+            async with AsyncExitStack() as exit_stack:
+                s3_client = await create_minio_s3_client(session, exit_stack)
+                # Salvo il file pdf
+                await s3_client.put_object(
+                    Bucket=BUCKET, Key=key, Body=content
+                )
+        except Exception as e:
+            raise StreamError(
+                f"Errore durante la creazione del documento in MinIO: {e}"
+            )
 
         index_document_task_sync.delay(
-            IndexedDocument(
-                doc_id=doc_id,
-                path=temp_path,
-                sub=metadata.sub,
-                title=metadata.title,
-                author=metadata.author,
-                filename=metadata.filename,
-                created_at=datetime.now(timezone.utc),
+            dict(
+                IndexedDocument(
+                    doc_id=doc_id,
+                    path=temp_path,
+                    sub=metadata.sub,
+                    title=metadata.title,
+                    author=metadata.author,
+                    filename=metadata.filename,
+                    created_at=datetime.now(timezone.utc),
+                )
             )
         )
-        
+
         return {
             "doc_id": doc_id,
             "message": "File uploaded, indexing in progress.",
-            "download_link": f"/download/{doc_id}",
         }
-
-    # async def index_document(
-    #     self, fs: AsyncGridFSBucket, es: AsyncElasticsearch, doc: IndexedDocument
-    # ) -> None:
-    #     try:
-    #         grid_out = await fs.open_download_stream(
-    #             doc.doc_id
-    #         )  # Prendo i dati dal db riferiti dall' _id del documento
-    #         content = await grid_out.read()
-    #     except Exception as e:
-    #         raise StreamError(message=e)
-
-    #     with pdfplumber.open(BytesIO(content)) as pdf:
-    #         actions = []
-    #         for i, page in enumerate(pdf.pages):
-    #             try:
-    #                 text = (page.extract_text() or "").strip()
-    #                 if text:
-    #                     actions.append(
-    #                         {
-    #                             "_op_type": "index",
-    #                             "_index": PAGES_INDEX,
-    #                             "_id": f"{doc.doc_id}_page_{i+1}",
-    #                             "_source": {
-    #                                 "doc_id": doc.doc_id,
-    #                                 "page": i + 1,
-    #                                 "text": text,
-    #                                 "metadata": {
-    #                                     "created_at": doc.created_at.isoformat()
-    #                                 },
-    #                             },
-    #                         }
-    #                     )
-    #             except Exception as e:
-    #                 raise StreamError(e)
-
-    #         if actions:
-    #             await async_bulk(es, actions, chunk_size=100, request_timeout=120)
-
-    #         await es.index(
-    #             index=DOCS_INDEX,
-    #             id=doc.doc_id,
-    #             body={
-    #                 "doc_id": doc.doc_id,
-    #                 "sub": doc.sub,
-    #                 "title": doc.title,
-    #                 "author": doc.author,
-    #                 "filename": doc.filename,
-    #                 "download_link": f"/download/{doc.doc_id}",
-    #                 "num_pages": len(pdf.pages),
-    #                 "metadata": {"created_at": doc.created_at.isoformat()},
-    #             },
-    #         )
 
     async def query_documents(
         self, es: AsyncElasticsearch, q: str
@@ -334,15 +300,26 @@ class DocumentService:
             raise DocumentIndexingError(e)
 
     async def get_download_document(
-        self, fs: AsyncGridFSBucket, doc_id: str, download: bool
+        self, doc_id: str, download: bool
     ) -> StreamingResponse:
+        filename = f"/{doc_id}.pdf"
+        key = f"/docs/{filename}"
+        
         try:
-            file = await fs.open_download_stream(doc_id)
-        except NoFile as e:
-            raise DocumentNotFound(e)
+            session = AioSession()
+            async with AsyncExitStack() as exit_stack:
+                s3_client = await create_minio_s3_client(session, exit_stack)
+                # Salvo il file pdf
+                file = await s3_client.get_object(Bucket=BUCKET, Key=key)
+                
+        # except NoFile as e:
+        #     raise DocumentNotFound(e)
+        except Exception as e:
+            raise StreamError(
+                f"Errore durante il recupero del documento in MinIO: {e}"
+            )
         except Exception as e:
             return Exception(e)
-
         if download:
             headers = {"Content-Disposition": f'attachment; filename="{file.filename}"'}
         else:
@@ -353,6 +330,7 @@ class DocumentService:
     async def get_preview_document(
         self, fs: AsyncGridFSBucket, doc_id: str, preview_size: int = 1024 * 1024
     ) -> StreamingResponse:
+        
         try:
             file = await fs.open_download_stream(doc_id)
             content = await file.read()

@@ -164,7 +164,7 @@ async def download_document(
     try:
         return await service.get_download_document(doc_id, download)
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Download failed")
+        raise HTTPException(status_code=500, detail=f"Download failed: {e} ")
 
 
 @router.get("/preview/{doc_id}")

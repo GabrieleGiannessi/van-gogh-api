@@ -1,8 +1,8 @@
 # worker.py
 import asyncio
 import os
-from io import BytesIO
 from celery import Celery
+from elasticsearch import AsyncElasticsearch
 import pdfplumber
 from app.clients import create_es_client
 from elasticsearch.helpers import async_bulk
@@ -14,14 +14,20 @@ PAGES_INDEX = os.getenv("PAGES_INDEX", "pages")
 broker_url = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
 celery_app = Celery("pdf_tasks", broker=broker_url)
 
-es = create_es_client()
 
 @celery_app.task
 def index_document_task_sync(doc: dict):
-    asyncio.run(_index_document_task(IndexedDocument(**doc)))
+    es = create_es_client()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_index_document_task(es, IndexedDocument(**doc)))
+    finally:
+        loop.run_until_complete(es.close())
+        loop.close()
 
 
-async def _index_document_task(doc: IndexedDocument):
+async def _index_document_task(es: AsyncElasticsearch, doc: IndexedDocument):
     # utilizzo la stringa che identifica il file temporaneo salvato per l'indicizzazione
     try:
         with pdfplumber.open(doc.path) as pdf:

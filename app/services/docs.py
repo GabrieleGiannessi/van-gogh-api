@@ -1,12 +1,17 @@
 # Service layer
+import asyncio
 from collections import defaultdict
 from datetime import datetime, timezone
+import logging
+from typing import AsyncGenerator
 from aiobotocore.session import AioSession
 from contextlib import AsyncExitStack
 import io
 import aiofiles
+from starlette.concurrency import run_in_threadpool
 from uuid import uuid4
-from fastapi import UploadFile
+from aiohttp import ClientError, ClientResponse
+from fastapi import Response, UploadFile
 from fastapi.responses import StreamingResponse
 from gridfs import NoFile
 from pdf2image import convert_from_bytes
@@ -19,7 +24,6 @@ from app.models import (
     PartialDocument,
 )
 from elasticsearch import AsyncElasticsearch
-from gridfs.asynchronous import AsyncGridFSBucket
 from app.exceptions import (
     DocumentCreationError,
     DocumentIndexingError,
@@ -92,7 +96,11 @@ class DocumentService:
         es: AsyncElasticsearch,
         doc_id: str,
     ) -> DocumentRead:
-        # Step 1: Elimina le pagine associate all'ID
+
+        img_key = f"images/{doc_id}.png"
+        docs_key = f"docs/{doc_id}.pdf"
+
+        # Elimina le pagine associate all'ID
         try:
             await es.delete_by_query(
                 index=PAGES_INDEX,
@@ -103,14 +111,14 @@ class DocumentService:
         except Exception as e:
             raise DocumentIndexingError(f"Errore durante delete_by_query: {e}")
 
-        # Step 2: Recupera i metadati per restituirli al chiamante
+        # Recupero i metadati per restituirli al chiamante
         try:
             res = await es.get(index=DOCS_INDEX, id=doc_id)
             doc_data = DocumentRead(**res["_source"])
         except Exception as e:
             raise DocumentIndexingError(f"Errore nel recupero del documento: {e}")
 
-        # Step 3: Elimina l'indice del documento
+        # Elimino l'indice del documento
         try:
             await es.delete(index=DOCS_INDEX, id=doc_id, refresh=True)
         except Exception as e:
@@ -118,17 +126,18 @@ class DocumentService:
                 f"Errore durante l'eliminazione del documento: {e}"
             )
 
-        # Step 4: Elimina il file PDF da MinIO
+        # Elimino il file PDF da MinIO
         try:
             session = AioSession()
             async with AsyncExitStack() as exit_stack:
                 s3_client = await create_minio_s3_client(session, exit_stack)
-                resp = await s3_client.delete_object(Bucket=BUCKET, Key=doc_id)
+                await s3_client.delete_object(Bucket=BUCKET, Key=docs_key)
+                await s3_client.delete_object(Bucket=BUCKET, Key=img_key)
 
         except Exception as e:
             raise StreamError(f"Errore durante la rimozione del file da MinIO: {e}")
 
-        return resp
+        return doc_data
 
     async def create_document(
         self,
@@ -139,13 +148,15 @@ class DocumentService:
         from app.worker import index_document_task_sync
 
         doc_id = str(uuid4())
-        folder = "/tmp"
-        filename = f"/{doc_id}.pdf"
-        temp_path = f"{folder}{filename}"
-        key = f"/docs/{filename}"
+        folder = "/shared"
+        filename = f"{doc_id}.pdf"
+        image = f"{doc_id}.png"
+        temp_path = f"{folder}/{filename}"
+        docs_key = f"docs/{filename}"
+        img_key = f"images/{image}"
 
         content = await file.read()
-        
+
         # Salvo in FS (Per indicizzazione)
         try:
             async with aiofiles.open(temp_path, "wb") as out_file:
@@ -155,20 +166,36 @@ class DocumentService:
                 f"Errore durante il salvataggio temporaneo: {e}"
             )
 
-        # Salvo in object storage (minIO)
+        # Salvo il documento in object storage (minIO)
         try:
             session = AioSession()
             async with AsyncExitStack() as exit_stack:
                 s3_client = await create_minio_s3_client(session, exit_stack)
-                # Salvo il file pdf
-                await s3_client.put_object(
-                    Bucket=BUCKET, Key=key, Body=content
+                # Salvo il file PDF
+                await s3_client.put_object(Bucket=BUCKET, Key=docs_key, Body=content)
+
+                # Salvo l'immagine anteprima
+                loop = asyncio.get_event_loop()
+                pages = await loop.run_in_executor(
+                    None, lambda: convert_from_bytes(content, first_page=1, last_page=1)
                 )
+                if not pages:
+                    raise PreviewException
+
+                img = pages[0]
+                img_bytes = io.BytesIO()
+                img.save(img_bytes, format="PNG")
+                img_bytes.seek(0)
+                await s3_client.put_object(
+                    Bucket=BUCKET, Key=img_key, Body=img_bytes.getvalue()
+                )
+
         except Exception as e:
             raise StreamError(
                 f"Errore durante la creazione del documento in MinIO: {e}"
             )
 
+        # Chiamo il task per l'indicizzazione
         index_document_task_sync.delay(
             dict(
                 IndexedDocument(
@@ -299,53 +326,61 @@ class DocumentService:
         except Exception as e:
             raise DocumentIndexingError(e)
 
-    async def get_download_document(
-        self, doc_id: str, download: bool
-    ) -> StreamingResponse:
-        filename = f"/{doc_id}.pdf"
-        key = f"/docs/{filename}"
+    async def get_download_document(self, doc_id: str, download: bool) -> StreamingResponse:
         
+        filename = f"{doc_id}.pdf"
+        key = f"docs/{filename}"
+        
+        session = AioSession()
+
+        async def file_iterator():
+            async with AsyncExitStack() as stack:
+                
+                s3_client = await create_minio_s3_client(session, stack)
+                try:
+                    
+                    response = await s3_client.get_object(Bucket=BUCKET, Key=key)
+                except ClientError as e:
+                    
+                    raise DocumentNotFound(f"Document {doc_id} not found in MinIO.")
+                except Exception as e:
+                    
+                    raise StreamError(f"Errore durante il recupero del documento in MinIO: {e}")
+
+                content_length = response.get("ContentLength", 0)
+                if content_length == 0:
+                    raise DocumentNotFound(f"Document {doc_id} is empty or not found.")
+                
+                stream = await stack.enter_async_context(response["Body"])
+                
+                async for chunk in stream.content.iter_chunked(1024 * 1024):
+                    
+                    yield chunk
+
+        disposition = "attachment" if download else "inline"
+        headers = {
+            "Content-Disposition": f'{disposition}; filename="{filename}"',
+        }
+
+        return StreamingResponse(
+            content=file_iterator(),
+            media_type="application/pdf",
+            headers=headers,
+        )
+
+    async def get_preview_document(self, doc_id: str) -> StreamingResponse:
+        filename = f"{doc_id}.png"
+        key = f"images/{filename}"
+
         try:
             session = AioSession()
             async with AsyncExitStack() as exit_stack:
                 s3_client = await create_minio_s3_client(session, exit_stack)
-                # Salvo il file pdf
-                file = await s3_client.get_object(Bucket=BUCKET, Key=key)
-                
-        # except NoFile as e:
-        #     raise DocumentNotFound(e)
+                response = await s3_client.get_object(Bucket=BUCKET, Key=key)
+                body = await response["Body"].read()
+        except ClientError:
+            raise DocumentNotFound(f"Image {doc_id} not found in MinIO.")
         except Exception as e:
-            raise StreamError(
-                f"Errore durante il recupero del documento in MinIO: {e}"
-            )
-        except Exception as e:
-            return Exception(e)
-        if download:
-            headers = {"Content-Disposition": f'attachment; filename="{file.filename}"'}
-        else:
-            headers = {"Content-Disposition": f'inline; filename="{file.filename}"'}
+            raise StreamError(f"Errore durante il recupero dell'immagine in MinIO: {e}")
 
-        return StreamingResponse(file, media_type="application/pdf", headers=headers)
-
-    async def get_preview_document(
-        self, fs: AsyncGridFSBucket, doc_id: str, preview_size: int = 1024 * 1024
-    ) -> StreamingResponse:
-        
-        try:
-            file = await fs.open_download_stream(doc_id)
-            content = await file.read()
-        except NoFile as n:
-            raise DocumentNotFound(n)
-        except Exception as e:
-            return Exception(e)
-
-        pages = convert_from_bytes(content, first_page=1, last_page=1)
-        if not pages:
-            raise PreviewException
-
-        img = pages[0]
-        img_bytes = io.BytesIO()
-        img.save(img_bytes, format="PNG")
-        img_bytes.seek(0)
-
-        return StreamingResponse(img_bytes, media_type="image/png")
+        return StreamingResponse(io.BytesIO(body), media_type="image/png")

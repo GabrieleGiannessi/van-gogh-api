@@ -84,42 +84,47 @@ services:
     depends_on:
       - redis
       - elasticsearch
+    volumes: 
+      - shared_tmp:/shared
     networks:
       - backend
 
-  fastapi:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: api
-    environment:
-      DOCS_INDEX: docs
-      PAGES_INDEX: pages
-      MINIO_CLIENT_URL: http://minio:9000
-      ES_HOST: http://elasticsearch:9200
-      CELERY_BROKER_URL: redis://redis:6379/0
-      KEYCLOAK_URL: http://keycloak:8080
-      REALM_RELATIVE_PATH: /realms/master
-      ALGORITHM: RS256
-      BUCKET: van-gogh-docs
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-    ports:
-      - "8000:8000"
-    depends_on:
-      - redis
-      - minio
-      - elasticsearch
-      - keycloak
-    networks:
-      - backend
+  # fastapi:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: api
+  #   environment:
+  #     DOCS_INDEX: docs
+  #     PAGES_INDEX: pages
+  #     MINIO_CLIENT_URL: http://minio:9000
+  #     ES_HOST: http://elasticsearch:9200
+  #     CELERY_BROKER_URL: redis://redis:6379/0
+  #     KEYCLOAK_URL: http://keycloak:8080
+  #     REALM_RELATIVE_PATH: /realms/master
+  #     ALGORITHM: RS256
+  #     BUCKET: van-gogh-docs
+  #     MINIO_ROOT_USER: minioadmin
+  #     MINIO_ROOT_PASSWORD: minioadmin
+  #   command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+  #   ports:
+  #     - "8000:8000"
+  #   depends_on:
+  #     - redis
+  #     - minio
+  #     - elasticsearch
+  #     - keycloak
+  #   volumes: 
+  #     - shared_tmp:/shared
+  #   networks:
+  #     - backend
 
 volumes:
   esdata:
   minio_data:
   pgdata:
   redisdata: 
+  shared_tmp:
 
 networks:
   backend:

@@ -216,10 +216,20 @@ class DocumentService:
         }
 
     async def query_documents(
-        self, es: AsyncElasticsearch, q: str
-    ) -> list[DocumentSearchResult]:
-        page_query = {"match": {"text": {"query": q, "fuzziness": "AUTO"}}}
+    self, es: AsyncElasticsearch, q: str
+) -> list[DocumentSearchResult]:
+        # Query per le pagine
+        page_query = {
+            "multi_match": {
+                "query": q,
+                "fields": ["text"],
+                "fuzziness": 1,       # massimo un errore di battitura
+                "operator": "and"
+            }
+        }
+
         highlight = {"fields": {"text": {}, "title": {}}}
+
         _source_pages = ["doc_id", "page", "text", "metadata"]
 
         page_res = await es.search(
@@ -246,6 +256,7 @@ class DocumentService:
 
         doc_ids = set()
 
+        # raccolgo risultati pagine
         for hit in page_res["hits"]["hits"]:
             doc = hit["_source"]
             highlights = hit.get("highlight", {})
@@ -261,12 +272,10 @@ class DocumentService:
                     highlight=highlights,
                 )
             )
-
             doc_ids.add(doc_id)
 
+        # Query per i documenti
         if doc_ids:
-            doc_query = {"terms": {"doc_id": list(doc_ids)}}
-
             _source_docs = [
                 "doc_id",
                 "title",
@@ -277,6 +286,23 @@ class DocumentService:
                 "sub",
             ]
 
+            # Query principale: multi_match + filtro doc_id
+            doc_query = {
+                "bool": {
+                    "must": [
+                        {
+                            "multi_match": {
+                                "query": q,
+                                "fields": ["title^3", "author", "filename"],
+                                "fuzziness": 1,
+                                "operator": "and",
+                            }
+                        },
+                        {"terms": {"doc_id": list(doc_ids)}},
+                    ]
+                }
+            }
+
             doc_res = await es.search(
                 index=DOCS_INDEX,
                 query=doc_query,
@@ -284,6 +310,15 @@ class DocumentService:
                 _source=_source_docs,
                 size=100,
             )
+
+            # Se nessun documento matcha con multi_match, recupero comunque i doc per doc_id
+            if not doc_res["hits"]["hits"]:
+                doc_res = await es.search(
+                    index=DOCS_INDEX,
+                    query={"terms": {"doc_id": list(doc_ids)}},
+                    _source=_source_docs,
+                    size=100,
+                )
 
             for hit in doc_res["hits"]["hits"]:
                 source = hit["_source"]
@@ -297,6 +332,7 @@ class DocumentService:
                 grouped[doc_id]["filename"] = source.get("filename")
                 grouped[doc_id]["sub"] = source.get("sub")
 
+                # evidenzia se il match era nel titolo
                 if "highlight" in hit and "title" in hit["highlight"]:
                     grouped[doc_id]["title_match"] = True
 

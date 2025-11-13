@@ -69,7 +69,7 @@ def has_role_in_client(payload: dict, client: str, role: str) -> bool:
 
 
 async def require_admin(token_data: dict = Depends(verify_token)) -> dict:
-    if not has_role_in_client(token_data, "van-gogh-dna", "van_gogh_admin"):
+    if not has_role_in_client(token_data, "van-gogh-dna", "van-gogh-admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Permessi insufficienti: ruolo van-gogh-admin richiesto.",

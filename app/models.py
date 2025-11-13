@@ -8,7 +8,7 @@ import os
 
 load_dotenv()
 class Metadata (BaseModel):
-    created_at: str
+    created_at: Optional[str] = None
     
 class DocumentCreateMetadata(BaseModel):
     sub: str 

@@ -1,6 +1,5 @@
 from datetime import datetime
 from typing import Optional
-from fastapi import Form, File
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
@@ -58,4 +57,6 @@ class DocumentSearchResult(BaseModel):
     
 class Settings(BaseSettings):
     minio_client: str = os.environ["MINIO_CLIENT_URL"]
-    es_host: str = os.environ["ES_HOST"]
+    es_host: str = os.environ["ES_URL"]
+    es_password: str = os.environ["ELASTIC_PASSWORD"]
+    es_user: str = os.environ.get("ES_USER", "elastic")

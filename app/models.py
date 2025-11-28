@@ -60,3 +60,4 @@ class Settings(BaseSettings):
     es_host: str = os.environ["ES_URL"]
     es_password: str = os.environ["ELASTIC_PASSWORD"]
     es_user: str = os.environ.get("ES_USER", "elastic")
+    es_ca_path: Optional[str] = os.environ.get("ES_CA_PATH", None)

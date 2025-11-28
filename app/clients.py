@@ -27,5 +27,9 @@ async def create_minio_s3_client(session: AioSession, exit_stack: AsyncExitStack
 
 # Funzione factory per creare ES client
 def create_es_client():
-    return AsyncElasticsearch(hosts=[settings.es_host],
-            basic_auth=(settings.es_user, settings.es_password))
+    return AsyncElasticsearch(
+        hosts=settings.es_host,
+        # basic_auth=(settings.es_user, settings.es_password),
+        # ca_certs=settings.es_ca_path,
+        # verify_certs=True,
+    )
